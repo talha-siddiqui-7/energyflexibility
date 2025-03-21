@@ -73,65 +73,83 @@ Q_net_cooling_conv = Q_conv  # Case 1: Only convective gain
 Q_net_cooling_conv_cond = Q_conv - Q_cond  # Case 2: Adding conductive loss
 Q_net_cooling_full = Q_conv - (Q_cond + Q_evap)  # Case 3: Adding evaporative loss
 
-# **Corrected T_ON and T_OFF Calculations**
+# **Heating ON Time**
 t_ON_conv = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv))
 t_ON_conv_cond = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv - Q_cond))
 t_ON_full = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv - Q_cond - Q_evap))
 
+# **Heating OFF Time**
 t_OFF_conv = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_conv)
 t_OFF_conv_cond = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_conv_cond)
 t_OFF_full = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_full)
 
-# **Define Simulation Time for 2 Full Cycles**
-total_simulation_hours = 2 * (t_ON_full + t_OFF_full) / 3600  # Two complete cycles
-time_step = 60  # Every 60 seconds
-time = np.arange(0, total_simulation_hours * 3600, time_step)  # In seconds
+# Convert OFF Time to Days
+t_OFF_days_conv = t_OFF_conv / 86400
+t_OFF_days_conv_cond = t_OFF_conv_cond / 86400
+t_OFF_days_full = t_OFF_full / 86400
 
-# **Temperature Profiles**
+# **Total Simulation Time for 2 Full Cycles**
+total_simulation_hours = 2 * (t_ON_full + t_OFF_full) / 3600
+
+# **Convert Energy to kWh**
+total_heating_kWh = (Q_heating_W * t_ON_full) / 3600 / 1000
+total_conv_kWh = (Q_conv * total_simulation_hours * 3600) / 3600 / 1000
+total_cond_kWh = (Q_cond * total_simulation_hours * 3600) / 3600 / 1000
+total_evap_kWh = (Q_evap * total_simulation_hours * 3600) / 3600 / 1000
+
+# **Print Energy Balance Results**
+print("\n===== Total Energy Balance (kWh) =====")
+print(f"Total Heating Input: {total_heating_kWh:.2f} kWh")
+print(f"Total Convective Gain: {total_conv_kWh:.2f} kWh")
+print(f"Total Conductive Loss: {total_cond_kWh:.2f} kWh")
+print(f"Total Evaporative Loss: {total_evap_kWh:.2f} kWh")
+
+print("\n===== Heating ON Durations (in hours) =====")
+print(f"Heating ON (Only Convective Gain): {t_ON_conv / 3600:.2f} hours")
+print(f"Heating ON (Convective Gain - Conductive Loss): {t_ON_conv_cond / 3600:.2f} hours")
+print(f"Heating ON (Convective Gain - Conductive Loss - Evaporative Loss): {t_ON_full / 3600:.2f} hours")
+
+print("\n===== Heating OFF Durations (in hours and days) =====")
+print(f"Heating OFF (Only Convective Gain): {t_OFF_conv / 3600:.2f} hours ({t_OFF_days_conv:.2f} days)")
+print(f"Heating OFF (Convective Gain - Conductive Loss): {t_OFF_conv_cond / 3600:.2f} hours ({t_OFF_days_conv_cond:.2f} days)")
+print(f"Heating OFF (Convective Gain - Conductive Loss - Evaporative Loss): {t_OFF_full / 3600:.2f} hours ({t_OFF_days_full:.2f} days)")
+
+# **Simulation for Temperature Evolution**
+time_step = 60
+time = np.arange(0, total_simulation_hours * 3600, time_step)
 temperature_conv = np.zeros_like(time, dtype=float)
 temperature_conv_cond = np.zeros_like(time, dtype=float)
 temperature_full = np.zeros_like(time, dtype=float)
 
-# **Simulation for Each Case**
+# **Run Simulation for Each Case**
 def simulate_temperature(t_ON, t_OFF, Q_gain, Q_loss, temp_array):
     T_current = T_min
     heating = True
-    time_since_last_switch = 0
-
     for i, t in enumerate(time):
         if heating:
             dT_dt = Q_gain / (m_water * C_p_water)
             T_current += dT_dt * time_step
             if T_current >= T_max:
                 heating = False
-                time_since_last_switch = 0
         else:
             dT_dt = Q_loss / (m_water * C_p_water)
             T_current += dT_dt * time_step
             if T_current <= T_min:
                 heating = True
-                time_since_last_switch = 0
-
         temp_array[i] = T_current
-        time_since_last_switch += time_step
 
-# **Run Simulation for Each Case**
-simulate_temperature(t_ON_conv, t_OFF_conv, Q_heating_W + Q_conv, Q_net_cooling_conv, temperature_conv)
-simulate_temperature(t_ON_conv_cond, t_OFF_conv_cond, Q_heating_W + Q_conv - Q_cond, Q_net_cooling_conv_cond, temperature_conv_cond)
+simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv, Q_net_cooling_conv, temperature_conv)
+simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv - Q_cond, Q_net_cooling_conv_cond, temperature_conv_cond)
 simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv - Q_cond - Q_evap, Q_net_cooling_full, temperature_full)
 
-# **Plot Results**
 plt.figure(figsize=(10, 5))
 plt.plot(time / 3600, temperature_conv, label="Only Convective Gain", color='b')
 plt.plot(time / 3600, temperature_conv_cond, label="Convective + Conductive Loss", color='orange')
 plt.plot(time / 3600, temperature_full, label="Convective + Conductive + Evaporative Loss", color='r')
-
-plt.axhline(T_max, linestyle="--", color="k", label="Heating OFF Threshold (26.5°C)")
-plt.axhline(T_min, linestyle="--", color="g", label="Heating ON Threshold (26°C)")
-
+plt.axhline(T_max, linestyle="--", color="k")
+plt.axhline(T_min, linestyle="--", color="g")
 plt.xlabel("Time (hours)")
 plt.ylabel("Temperature (°C)")
-plt.title("Temperature Evolution with Different Losses (2 Complete Cycles)")
 plt.legend()
 plt.grid()
 plt.show()
