@@ -92,7 +92,7 @@ t_OFF_days_full = t_OFF_full / 86400
 total_simulation_hours = 2 * (t_ON_full + t_OFF_full) / 3600
 
 # **Convert Energy to kWh**
-total_heating_kWh = (Q_heating_W * t_ON_full) / 3600 / 1000
+total_heating_kWh = 2*(Q_heating_W * t_ON_full) / 3600 / 1000
 total_conv_kWh = (Q_conv * total_simulation_hours * 3600) / 3600 / 1000
 total_cond_kWh = (Q_cond * total_simulation_hours * 3600) / 3600 / 1000
 total_evap_kWh = (Q_evap * total_simulation_hours * 3600) / 3600 / 1000
@@ -153,3 +153,70 @@ plt.ylabel("Temperature (°C)")
 plt.legend()
 plt.grid()
 plt.show()
+
+# === Corrected Plot: Two Full Cycles for Convective & Convective + Conductive ===
+
+# Define correct total time (2 full cycles) based on the two scenarios
+t_total_2cycles_conv = 2 * (t_ON_conv + t_OFF_conv)
+t_total_2cycles_cond = 2 * (t_ON_conv_cond + t_OFF_conv_cond)
+t_max_sim = max(t_total_2cycles_conv, t_total_2cycles_cond)
+
+time_2cycles = np.arange(0, t_max_sim, time_step)
+temperature_conv_2 = np.zeros_like(time_2cycles, dtype=float)
+temperature_conv_cond_2 = np.zeros_like(time_2cycles, dtype=float)
+
+# Simulate two full cycles for each case
+def simulate_cycles(t_ON, t_OFF, Q_gain, Q_loss, temp_array):
+    T_current = T_min
+    heating = True
+    cycle_time = t_ON + t_OFF
+    for i, t in enumerate(time_2cycles):
+        cycle_progress = t % cycle_time
+        if cycle_progress < t_ON:
+            dT_dt = Q_gain / (m_water * C_p_water)
+        else:
+            dT_dt = Q_loss / (m_water * C_p_water)
+        T_current += dT_dt * time_step
+        T_current = min(max(T_current, T_min), T_max)  # clamp
+        temp_array[i] = T_current
+
+simulate_cycles(t_ON_conv, t_OFF_conv, Q_heating_W + Q_conv, Q_net_cooling_conv, temperature_conv_2)
+simulate_cycles(t_ON_conv_cond, t_OFF_conv_cond, Q_heating_W + Q_conv - Q_cond, Q_net_cooling_conv_cond, temperature_conv_cond_2)
+
+# Plot
+plt.figure(figsize=(10, 5))
+plt.plot(time_2cycles / 3600, temperature_conv_2, label="Only Convective Gain", color='b')
+plt.plot(time_2cycles / 3600, temperature_conv_cond_2, label="Convective + Conductive Loss", color='orange')
+plt.axhline(T_max, linestyle="--", color="k", label="Heating OFF Threshold (26.5°C)")
+plt.axhline(T_min, linestyle="--", color="g", label="Heating ON Threshold (26°C)")
+plt.xlabel("Time (hours)")
+plt.ylabel("Temperature (°C)")
+plt.title("Convective vs Convective + Conductive Loss")
+plt.legend()
+plt.grid()
+plt.show()
+
+import matplotlib.ticker as ticker
+
+# === Bar Chart: Convective + Conductive Loss Case ===
+plt.figure(figsize=(6, 4))
+plt.bar(['Heating ON', 'Heating OFF'],
+        [t_ON_conv_cond / 3600, t_OFF_conv_cond / 3600],
+        color=['orange', 'gray'])
+plt.ylabel("Time (hours)")
+plt.title("Heating ON/OFF Duration\n(Convective + Conductive Loss)")
+plt.grid(axis='y', linestyle='--')
+plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+plt.show()
+
+# === Bar Chart: Convective + Conductive + Evaporative Loss Case ===
+plt.figure(figsize=(6, 4))
+plt.bar(['Heating ON', 'Heating OFF'],
+        [t_ON_full / 3600, t_OFF_full / 3600],
+        color=['red', 'gray'])
+plt.ylabel("Time (hours)")
+plt.title("Heating ON/OFF Duration\n(Convective + Conductive + Evaporative Loss)")
+plt.grid(axis='y', linestyle='--')
+plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
+plt.show()
+
