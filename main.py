@@ -1,199 +1,149 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
+import math
 
-# Given values
-T_min = 26.0  # °C (Heating ON threshold)
-T_max = 26.5  # °C (Heating OFF threshold)
-T_air_facility = T_min + 2  # Facility air temperature
+# --- Universal Constants (SI units) ---
+LATENT_HEAT_VAPORIZATION = 2.43e6     # J/kg
+SPECIFIC_HEAT_WATER = 4186            # J/(kg·°C)
+KINEMATIC_VISCOSITY_AIR = 15.89e-6    # m²/s
+AIR_THERMAL_CONDUCTIVITY = 0.025      # W/(m·K)
+PRANDTL_NUMBER_AIR = 0.7              # dimensionless
+DENSITY_WATER = 1000                   # kg/m³
+SECONDS_PER_HOUR = 3600
+Q_HEATER_DURATION_HR = 72             # Guideline-based duration
+U_s = 2.94                            # W/m²·K (side walls)
+U_b = 0.5                             # W/m²·K (bottom)
+AIR_VELOCITY = 0.2                    # m/s (assumed constant)
+HEAT_RECOVERY_EFFICIENCY = 0.6        # Assumed 60% efficiency
 
-# Pool properties
-rho_water = 1000  # kg/m³
-V_pool = 25 * 12 * 2  # m³
-m_water = rho_water * V_pool  # kg
-C_p_water = 4184  # J/kg·K
+# --- Input collection ---
+print("Enter pool and hall dimensions:")
 
-# Surface areas
-A_pool = 25 * 12  # m²
-A_s = 2 * (25 * 2 + 12 * 2) * 2  # m²
-A_b = 25 * 12  # m²
+pool_length = float(input("Pool length (m): "))
+pool_width = float(input("Pool width (m): "))
+pool_depth = float(input("Average pool depth (m): "))
 
-# User inputs
-rel_humidity = float(input("Enter relative humidity (e.g., 60 for 60%): ")) / 100
-F_a = float(input("Enter activity factor (F_a): "))
-Q_heating_kW = float(input("Enter heating capacity of pool heater (in kW): "))
-Q_heating_W = Q_heating_kW * 1000
+hall_length = float(input("Pool hall length (m): "))
+hall_width = float(input("Pool hall width (m): "))
+hall_height = float(input("Pool hall height (m): "))
 
-# Air properties
-k_air = 0.025
-nu_air = 15.89e-6
-Pr_air = 0.7
-V_air = 0.2
-L_pool = 25
+tap_water_temp = float(input("Tap water temperature (°C): "))
+pool_setpoint_temp = float(input("Desired pool water temperature setpoint (°C): "))
+technical_room_temp = float(input("Technical room temperature (°C): "))
 
-# Convective heat transfer
-Re = (V_air * L_pool) / nu_air
-Nu = 0.0296 * (Re**0.8) * (Pr_air**(1/3))
-h_conv = (Nu * k_air) / L_pool
-Q_conv = 2 * h_conv * A_pool
+heating_duration_hr = float(input("Heating duration for analysis (hours): "))
+max_relative_humidity = float(input("Maximum acceptable relative humidity (%): "))
+current_relative_humidity = float(input("Current indoor relative humidity (%): "))
+activity_factor = float(input("Activity factor for evaporation calculation (e.g. 1.0 for normal use): "))
+number_of_persons_per_day = int(input("Number of pool users per day: "))
 
-# Conductive heat transfer
-U_s = 2.94
-U_b = 0.5
-T_rs = float(input("Enter T_rs (space temperature) in °C: "))
-T_g = float(input("Enter T_g (ground temperature) in °C: "))
-Q_cond = (U_s * A_s * (T_max - T_rs)) + (U_b * A_b * (T_max - T_g))
+# --- Derived quantities ---
+pool_surface_area = pool_length * pool_width
+pool_volume = pool_surface_area * pool_depth
+hall_area = hall_length * hall_width
+hall_volume = hall_area * hall_height
 
-# === Evaporative Loss Calculation (with pool area in ft² for this part only) ===
-def P_sat(T):
-    return 610.7 * np.exp((17.27 * T) / (T + 237.3))
+# --- Q_heater Calculation ---
+mass_pool_water = pool_volume * DENSITY_WATER
+delta_T_heating = pool_setpoint_temp - tap_water_temp
+Q_heater_J = mass_pool_water * SPECIFIC_HEAT_WATER * delta_T_heating
+Q_heater_kW = Q_heater_J / (Q_HEATER_DURATION_HR * SECONDS_PER_HOUR * 1000)
 
-def dew_point(T_air, RH):
-    return (237.3 * np.log(RH) + (17.27 * T_air)) / (17.27 - np.log(RH))
+# --- Q_cond Calculation ---
+A_s = 2 * (pool_length + pool_width) * pool_depth
+A_b = pool_length * pool_width
+delta_T_cond = pool_setpoint_temp - technical_room_temp
+Q_side = U_s * A_s * delta_T_cond
+Q_bottom = U_b * A_b * delta_T_cond
+Q_cond = Q_side + Q_bottom
 
-Pw = P_sat(T_max)
-T_dew = dew_point(T_air_facility, rel_humidity)
-Pa = P_sat(T_dew)
+# --- Q_evap Calculation ---
+air_temp = pool_setpoint_temp + 2
+RH_decimal = current_relative_humidity / 100
 
-Pw_inHg = Pw * 0.0002953
-Pa_inHg = Pa * 0.0002953
+def saturation_pressure(T):
+    return 610.7 * math.exp((17.27 * T) / (T + 237.3))
 
-A_pool_ft2 = A_pool * 10.7639  # Convert pool area to square feet for imperial formula
-M_evap_lb_hr = 0.1 * A_pool_ft2 * (Pw_inHg - Pa_inHg) * F_a
-M_evap_kg_hr = M_evap_lb_hr * 0.453592
-M_evap_kg_s = M_evap_kg_hr / 3600
+P_w = saturation_pressure(pool_setpoint_temp)
+ln_RH = math.log(RH_decimal)
+T_dew = (237.3 * ln_RH) / (17.27 - ln_RH) + air_temp
+P_a = saturation_pressure(T_dew)
 
-L = 2.43e6  # J/kg
-Q_evap = M_evap_kg_s * L  # W
+P_w_inHg = P_w * 0.0002953
+P_a_inHg = P_a * 0.0002953
 
-# === ON/OFF Time Calculations ===
-Q_net_cooling_conv = Q_conv
-Q_net_cooling_conv_cond = Q_conv - Q_cond
-Q_net_cooling_full = Q_conv - (Q_cond + Q_evap)
+# Convert area from m² to ft²
+pool_surface_area_ft2 = pool_surface_area * 10.7639
 
-t_ON_conv = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv))
-t_ON_conv_cond = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv - Q_cond))
-t_ON_full = abs((m_water * C_p_water * (T_max - T_min)) / (Q_heating_W + Q_conv - Q_cond - Q_evap))
+# Then use this in the evaporation formula
+evaporation_lb_per_hr = 0.1 * pool_surface_area_ft2 * (P_w_inHg - P_a_inHg) * activity_factor
 
-t_OFF_conv = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_conv)
-t_OFF_conv_cond = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_conv_cond)
-t_OFF_full = abs((m_water * C_p_water * (T_max - T_min)) / Q_net_cooling_full)
+evaporation_kg_per_hr = evaporation_lb_per_hr * 0.453592
+Q_evap = evaporation_kg_per_hr * LATENT_HEAT_VAPORIZATION / 3600
 
-t_OFF_days_conv = t_OFF_conv / 86400
-t_OFF_days_conv_cond = t_OFF_conv_cond / 86400
-t_OFF_days_full = t_OFF_full / 86400
+# --- Q_conv Calculation ---
+Re = (AIR_VELOCITY * pool_length) / KINEMATIC_VISCOSITY_AIR
+Nu = 0.0296 * (Re ** 0.8) * (PRANDTL_NUMBER_AIR ** (1 / 3))
+h_conv = (Nu * AIR_THERMAL_CONDUCTIVITY) / pool_length
+Q_conv = 2 * h_conv * pool_surface_area
 
-# === Total Simulation Time ===
-total_simulation_hours = 2 * (t_ON_full + t_OFF_full) / 3600
+# --- Q_makeup Calculation ---
+hygiene_water_L_per_day = 30 * number_of_persons_per_day
+evaporation_L_per_day = evaporation_kg_per_hr * 24
+total_makeup_water_L = hygiene_water_L_per_day + evaporation_L_per_day
+mass_makeup_water = total_makeup_water_L
+delta_T_makeup = pool_setpoint_temp - tap_water_temp
+Q_makeup_kJ_per_day = mass_makeup_water * SPECIFIC_HEAT_WATER * delta_T_makeup / 1000
+Q_makeup_kW = Q_makeup_kJ_per_day / 3600 / 24
 
-# === Energy Balance ===
-total_heating_kWh = 2 * (Q_heating_W * t_ON_full) / 3600 / 1000
-total_conv_kWh = (Q_conv * total_simulation_hours)
-total_cond_kWh = (Q_cond * total_simulation_hours)
-total_evap_kWh = (Q_evap * total_simulation_hours)
+# --- Q_recovery Calculation ---
+T_drain = pool_setpoint_temp
+T_inlet = tap_water_temp
+Q_recovery_kJ_per_day = HEAT_RECOVERY_EFFICIENCY * hygiene_water_L_per_day * SPECIFIC_HEAT_WATER * (T_drain - T_inlet) / 1000
+Q_recovery_kW = Q_recovery_kJ_per_day / 3600 / 24
 
-print("\n===== Total Energy Balance (kWh) =====")
-print(f"Total Heating Input: {total_heating_kWh:.2f} kWh")
-print(f"Total Convective Gain: {total_conv_kWh:.2f} kWh")
-print(f"Total Conductive Loss: {total_cond_kWh:.2f} kWh")
-print(f"Total Evaporative Loss: {total_evap_kWh:.2f} kWh\n")
+# --- Final ΔT Calculation (Temperature Rise in Pool Water) ---
+# Ensure all Q terms are in Watts
+Q_heater_W = Q_heater_kW * 1000
+Q_recovery_W = Q_recovery_kW * 1000
+Q_makeup_W = Q_makeup_kW * 1000
 
-print("===== Heating ON Durations (in hours) =====")
-print(f"Only Convective Gain: {t_ON_conv / 3600:.2f} h")
-print(f"Conv. Gain - Cond. Loss: {t_ON_conv_cond / 3600:.2f} h")
-print(f"Conv. Gain - Cond. - Evap. Loss: {t_ON_full / 3600:.2f} h\n")
+# Duration in seconds
+t_seconds = heating_duration_hr * SECONDS_PER_HOUR
 
-print("===== Heating OFF Durations (in hours and days) =====")
-print(f"Only Convective Gain: {t_OFF_conv / 3600:.2f} h ({t_OFF_days_conv:.2f} days)")
-print(f"Conv. Gain - Cond. Loss: {t_OFF_conv_cond / 3600:.2f} h ({t_OFF_days_conv_cond:.2f} days)")
-print(f"Conv. Gain - Cond. - Evap. Loss: {t_OFF_full / 3600:.2f} h ({t_OFF_days_full:.2f} days)")
+# Net energy input to water (Joules)
+Q_net = t_seconds * (Q_heater_W + Q_conv + Q_recovery_W - Q_cond - Q_evap - Q_makeup_W)
 
-# === Simulation: Temperature Evolution ===
-time_step = 60
-time = np.arange(0, total_simulation_hours * 3600, time_step)
-temperature_conv = np.zeros_like(time, dtype=float)
-temperature_conv_cond = np.zeros_like(time, dtype=float)
-temperature_full = np.zeros_like(time, dtype=float)
+# ΔT calculation
+delta_T_pool_water = Q_net / (mass_pool_water * SPECIFIC_HEAT_WATER)
 
-def simulate_temperature(t_ON, t_OFF, Q_gain, Q_loss, temp_array):
-    T_current = T_min
-    heating = True
-    for i, t in enumerate(time):
-        dT_dt = Q_gain / (m_water * C_p_water) if heating else Q_loss / (m_water * C_p_water)
-        T_current += dT_dt * time_step
-        if heating and T_current >= T_max: heating = False
-        elif not heating and T_current <= T_min: heating = True
-        temp_array[i] = T_current
 
-simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv, Q_net_cooling_conv, temperature_conv)
-simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv - Q_cond, Q_net_cooling_conv_cond, temperature_conv_cond)
-simulate_temperature(t_ON_full, t_OFF_full, Q_heating_W + Q_conv - Q_cond - Q_evap, Q_net_cooling_full, temperature_full)
 
-# === Plot 1: Temperature Evolution ===
-plt.figure(figsize=(10, 5))
-plt.plot(time / 3600, temperature_conv, label="Only Convective Gain", color='b')
-plt.plot(time / 3600, temperature_conv_cond, label="Conv. + Cond. Loss", color='orange')
-plt.plot(time / 3600, temperature_full, label="Conv. + Cond. + Evap. Loss", color='r')
-plt.axhline(T_max, linestyle="--", color="k")
-plt.axhline(T_min, linestyle="--", color="g")
-plt.xlabel("Time (hours)")
-plt.ylabel("Temperature (°C)")
-plt.legend()
-plt.grid()
-plt.show()
 
-# === Plot 2: Two Full Cycles ===
-t_total_2cycles_conv = 2 * (t_ON_conv + t_OFF_conv)
-t_total_2cycles_cond = 2 * (t_ON_conv_cond + t_OFF_conv_cond)
-t_max_sim = max(t_total_2cycles_conv, t_total_2cycles_cond)
-time_2cycles = np.arange(0, t_max_sim, time_step)
-temperature_conv_2 = np.zeros_like(time_2cycles, dtype=float)
-temperature_conv_cond_2 = np.zeros_like(time_2cycles, dtype=float)
+# --- Output Section ---
+print("\n--- Derived Parameters ---")
+print(f"Pool surface area: {pool_surface_area:.2f} m²")
+print(f"Pool volume: {pool_volume:.2f} m³")
+print(f"Pool hall volume: {hall_volume:.2f} m³")
 
-def simulate_cycles(t_ON, t_OFF, Q_gain, Q_loss, temp_array):
-    T_current = T_min
-    heating = True
-    cycle_time = t_ON + t_OFF
-    for i, t in enumerate(time_2cycles):
-        cycle_progress = t % cycle_time
-        dT_dt = Q_gain / (m_water * C_p_water) if cycle_progress < t_ON else Q_loss / (m_water * C_p_water)
-        T_current += dT_dt * time_step
-        T_current = min(max(T_current, T_min), T_max)
-        temp_array[i] = T_current
+print("\n--- Q_heater Calculation ---")
+print(f"Q_heater (avg. power over 72h): {Q_heater_kW:.2f} kW")
 
-simulate_cycles(t_ON_conv, t_OFF_conv, Q_heating_W + Q_conv, Q_net_cooling_conv, temperature_conv_2)
-simulate_cycles(t_ON_conv_cond, t_OFF_conv_cond, Q_heating_W + Q_conv - Q_cond, Q_net_cooling_conv_cond, temperature_conv_cond_2)
+print("\n--- Q_cond Calculation ---")
+print(f"Q_cond (total): {Q_cond:.2f} W ≈ {Q_cond / 1000:.2f} kW")
 
-plt.figure(figsize=(10, 5))
-plt.plot(time_2cycles / 3600, temperature_conv_2, label="Only Convective Gain", color='b')
-plt.plot(time_2cycles / 3600, temperature_conv_cond_2, label="Convective + Conductive Loss", color='orange')
-plt.axhline(T_max, linestyle="--", color="k", label="Heating OFF Threshold (26.5°C)")
-plt.axhline(T_min, linestyle="--", color="g", label="Heating ON Threshold (26°C)")
-plt.xlabel("Time (hours)")
-plt.ylabel("Temperature (°C)")
-plt.title("Convective vs Convective + Conductive Loss")
-plt.legend()
-plt.grid()
-plt.show()
+print("\n--- Q_evap Calculation ---")
+print(f"Evaporation rate: {evaporation_kg_per_hr:.2f} kg/hr")
+print(f"Q_evap: {Q_evap:.2f} W ≈ {Q_evap / 1000:.2f} kW")
 
-# === Plot 3: Bar Chart – Convective + Conductive Loss ===
-plt.figure(figsize=(6, 4))
-plt.bar(['Heating ON', 'Heating OFF'],
-        [t_ON_conv_cond / 3600, t_OFF_conv_cond / 3600],
-        color=['orange', 'gray'])
-plt.ylabel("Time (hours)")
-plt.title("Heating ON/OFF Duration\n(Convective + Conductive Loss)")
-plt.grid(axis='y', linestyle='--')
-plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-plt.show()
+print("\n--- Q_conv Calculation ---")
+print(f"Q_conv: {Q_conv:.2f} W ≈ {Q_conv / 1000:.2f} kW")
 
-# === Plot 4: Bar Chart – Convective + Conductive + Evaporative Loss ===
-plt.figure(figsize=(6, 4))
-plt.bar(['Heating ON', 'Heating OFF'],
-        [t_ON_full / 3600, t_OFF_full / 3600],
-        color=['red', 'gray'])
-plt.ylabel("Time (hours)")
-plt.title("Heating ON/OFF Duration\n(Convective + Conductive + Evaporative Loss)")
-plt.grid(axis='y', linestyle='--')
-plt.gca().yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
-plt.show()
+print("\n--- Q_makeup Calculation ---")
+print(f"Total makeup water: {total_makeup_water_L:.2f} L/day")
+print(f"Q_makeup: {Q_makeup_kJ_per_day:.2f} kJ/day ≈ {Q_makeup_kW:.2f} kW")
+
+print("\n--- Q_recovery Calculation ---")
+print(f"Q_recovery: {Q_recovery_kJ_per_day:.2f} kJ/day ≈ {Q_recovery_kW:.2f} kW")
+
+# --- Print Result ---
+print("\n--- Final Result ---")
+print(f"Temperature increase in pool water (ΔT): {delta_T_pool_water:.2f} °C")
