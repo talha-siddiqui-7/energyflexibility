@@ -13,6 +13,7 @@ U_s = 2.94                            # W/m²·K (side walls)
 U_b = 0.5                             # W/m²·K (bottom)
 AIR_VELOCITY = 0.2                    # m/s (assumed constant)
 HEAT_RECOVERY_EFFICIENCY = 0.6        # Assumed 60% efficiency
+COP_DEHUMIDIFIER = 4  # Coefficient of performance of evaporator
 
 # --- Input collection ---
 print("Enter pool and hall dimensions:")
@@ -115,6 +116,44 @@ Q_net = t_seconds * (Q_heater_W + Q_conv + Q_recovery_W - Q_cond - Q_evap - Q_ma
 # ΔT calculation
 delta_T_pool_water = Q_net / (mass_pool_water * SPECIFIC_HEAT_WATER)
 
+# --- Sensible Energy Stored Calculation ---
+Q_sensible_J = mass_pool_water * SPECIFIC_HEAT_WATER * delta_T_pool_water
+Q_sensible_kWh = Q_sensible_J / (3600 * 1000)
+
+# --- Latent Energy Storage in Facility Air ---
+
+# Step 1: Saturation vapor pressure (Pa) lookup for setpoint temp
+svp_table = {
+    25: 3170,
+    26: 3360,
+    27: 3570,
+    28: 3780,
+    29: 4000,
+    30: 4240
+}
+rounded_setpoint = round(pool_setpoint_temp)
+Pv = svp_table.get(rounded_setpoint, 3780)  # default to 28°C value
+
+# Step 2: Calculate humidity ratios
+P_atm = 101325  # Pa
+Pv_current = (current_relative_humidity / 100) * Pv
+Pv_max = (max_relative_humidity / 100) * Pv
+
+W_current = 0.622 * Pv_current / (P_atm - Pv_current)
+W_max = 0.622 * Pv_max / (P_atm - Pv_max)
+delta_W = W_max - W_current
+
+# Step 3: Air mass and latent storage
+DENSITY_AIR = 1.2  # kg/m³
+mass_air = hall_volume * DENSITY_AIR
+m_storage_max = delta_W * mass_air
+
+# Step 4: Latent energy stored
+Q_latent_J = m_storage_max * LATENT_HEAT_VAPORIZATION
+Q_latent_kWh = Q_latent_J / 3.6e6
+
+# --- Electric Load Shifted via Latent Energy ---
+W_shifted_kWh = Q_latent_kWh / (COP_DEHUMIDIFIER - 1)
 
 
 
@@ -147,3 +186,15 @@ print(f"Q_recovery: {Q_recovery_kJ_per_day:.2f} kJ/day ≈ {Q_recovery_kW:.2f} k
 # --- Print Result ---
 print("\n--- Final Result ---")
 print(f"Temperature increase in pool water (ΔT): {delta_T_pool_water:.2f} °C")
+
+print(f"\n--- Sensible Energy Stored ---")
+print(f"Energy stored in pool water: {Q_sensible_kWh:.2f} kWh")
+
+print("\n--- Latent Energy Storage in Facility Air ---")
+print(f"Humidity ratio change (ΔW): {delta_W:.6f} kg water/kg dry air")
+print(f"Mass of air in hall: {mass_air:.2f} kg")
+print(f"Water storage capacity in air: {m_storage_max:.2f} kg")
+print(f"Latent energy stored in air: {Q_latent_kWh:.2f} kWh")
+
+print(f"\n--- Electric Load Shifted via Latent Energy ---")
+print(f"Electric load shifted: {W_shifted_kWh:.2f} kWh")
