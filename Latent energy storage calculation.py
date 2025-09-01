@@ -4,6 +4,10 @@ Validation script (single-run, event windows)
 Adds:
 - Nonlinear evaporation + time-varying W_sup(t), m_vent(t) toggles
 - Per-event fit of tau_fit, Winf_fit and ke_fit from IDA ICE trace
+- PRINTS average total latent energy storage per day (IDA vs Model)
+- STABLE time-varying simulation:
+    * exact interval update for linearized mode
+    * adaptive sub-stepping + physical clamps for nonlinear mode
 """
 
 import pandas as pd, numpy as np, math, os
@@ -21,7 +25,7 @@ OUTPUT_PER_NIGHT = r"M:\PhD\02 Data sets from simulations\Air Flexibility\true_s
 # ------------------------- SITE / MODEL SETTINGS -------------------------
 VOLUME_M3       = 19.65 * 13.8 * 4.95
 PRESSURE_PA     = 101325.0
-RELAXED_RH_STAR = 0.65
+RELAXED_RH_STAR = 0.58
 POOL_WATER_T_C  = 28.0
 C_EVAP = 4.0e-8          # kg/(s·m²·Pa)  (calibrate once on a clean event)
 F_A    = 0.5
@@ -29,14 +33,18 @@ POOL_AREA_M2 = 100.0
 
 # Event definition
 START_HOUR  = 20
-DURATION_H  = 3
+DURATION_H  = 6
 EXPLICIT_EVENTS = []
 
-# ------------------------- NEW TOGGLES -------------------------
-USE_TIME_VARYING = True # use W_sup(t), m_vent(t) within window
-USE_NONLINEAR    = False   # exact evaporation law (else linearized)
-USE_AVG_FLOW     = False  # m_vent = 0.5*(m_sup+m_ext) else m_sup
+# ------------------------- TOGGLES -------------------------
+USE_TIME_VARYING = True    # use W_sup(t), m_vent(t) within window
+USE_NONLINEAR    = True    # exact evaporation law (else linearized)
+USE_AVG_FLOW     = False   # m_vent = 0.5*(m_sup+m_ext) else m_sup
 PLOTS_SHOW       = True
+
+# ---- Stability controls for nonlinear path ----
+MAX_SUBSTEP_S    = 60.0    # cap substep to 60 s
+CLAMP_ENABLED    = True    # clamp 0 <= W <= W_sat(T) each substep
 
 # ------------------------- Psychro helpers -------------------------
 def psat_pa(T_C: float) -> float:
@@ -62,6 +70,16 @@ def h_fg_J_per_kg(T_C: float) -> float:
 
 def RH_from_W_T(W, T_C, p_atm=PRESSURE_PA):
     return Pv_from_W(W, p_atm) / psat_pa(T_C)
+
+def W_sat_from_T(T_C: float, p_atm: float = PRESSURE_PA) -> float:
+    Ps = psat_pa(T_C)
+    Ps = min(Ps, 0.99*p_atm)  # safety
+    return 0.622 * Ps / (p_atm - Ps)
+
+def clamp_W(W: float, T_C: float) -> float:
+    if not CLAMP_ENABLED:
+        return W
+    return max(0.0, min(W, W_sat_from_T(T_C)))
 
 # ------------------------- CSV loader (robust to 2-row header) -------------------------
 def load_single_run(path):
@@ -151,7 +169,7 @@ def load_single_run(path):
 
     return out.dropna(subset=["time", "w_ret", "w_sup", "m_sup"]).reset_index(drop=True)
 
-# ------------------------- Linearized (for reference) -------------------------
+# ------------------------- Linearized (for reference / constants) -------------------------
 def ke_from_W0(W0, p_atm=PRESSURE_PA):
     dPa_dW = p_atm * 0.622 / (0.622 + W0)**2
     return C_EVAP * POOL_AREA_M2 * F_A * dPa_dW
@@ -170,13 +188,15 @@ def model_event_linear_avg(W0, Wsup_bar, m_vent_bar, Tair_bar, Tw_bar, dt_h, RH_
     Q = h_fg_J_per_kg(Tair_bar) * m_air * dW / 3.6e6
     return {"k_e":k_e,"m_air":m_air,"tau":tau,"Winf":Winf,"Wend":Wend,"dW_ach":dW,"Qlatent_kWh":Q}
 
-# ------------------------- NEW: step integrator (linearized or exact) -------------------------
+# ------------------------- STABLE time-varying simulator -------------------------
 def simulate_event_timevary(win: pd.DataFrame, W0: float, Tair_bar: float, Tw_bar: float,
                             RH_star: float|None, use_nonlinear=True, use_avg_flow=False,
                             p_atm: float = PRESSURE_PA):
     """
-    Integrates dW/dt = [ m_evap(W) + m_vent(t)*(W_sup(t)-W) ] / m_air
-    with measured time steps inside the window.
+    Stable integration of:
+        dW/dt = [ m_evap(W) + m_vent(t)*(W_sup(t) - W) ] / m_air
+    If use_nonlinear=False: exact per-interval update for linearized source.
+    If use_nonlinear=True : adaptive sub-stepping + clamps.
     """
     # air mass constant over window
     m_air = rho_da_from_wT(W0, Tair_bar, p_atm) * VOLUME_M3
@@ -189,34 +209,60 @@ def simulate_event_timevary(win: pd.DataFrame, W0: float, Tair_bar: float, Tw_ba
     wsup  = win["w_sup"].values
     tair  = win["T_room_C"].values
     tsec  = (win["time"] - win["time"].iloc[0]).dt.total_seconds().values
-    dt    = np.diff(tsec, prepend=tsec[0])
+    dt_iv = np.diff(tsec, prepend=tsec[0])
 
-    # constants
-    Pw = psat_pa(Tw_bar)
-    if not use_nonlinear:
-        k_e = ke_from_W0(W0, p_atm)
-        Pa0 = Pv_from_W(W0, p_atm)
-        m0  = C_EVAP * POOL_AREA_M2 * (Pw - Pa0) * F_A  # start source
+    Pw  = psat_pa(Tw_bar)
+    Pa0 = Pv_from_W(W0, p_atm)
+    m0  = C_EVAP * POOL_AREA_M2 * (Pw - Pa0) * F_A
+    k_e0 = ke_from_W0(W0, p_atm)
 
     W = float(W0)
     W_series = [W0]
+
     for i in range(1, len(tsec)):
-        # evaporation term
-        if use_nonlinear:
-            Pa = Pv_from_W(W, p_atm)
-            m_evap = C_EVAP * POOL_AREA_M2 * (Pw - Pa) * F_A
-        else:
-            m_evap = m0 - ke_from_W0(W0,p_atm)*(W - W0)
+        Δt = float(dt_iv[i])
+        if Δt <= 0:
+            W_series.append(W); continue
 
-        # ventilation sink/source
-        m_sink = mvent[i] * (wsup[i] - W)
+        if not use_nonlinear:
+            # ----- exact interval update for linearized source -----
+            denom = (mvent[i] + k_e0)
+            if denom <= 0:
+                W_series.append(W); continue
+            τk   = m_air / denom
+            Winf = (m0 + k_e0*W0 + mvent[i]*wsup[i]) / denom
+            Wnew = Winf + (W - Winf) * math.exp(-Δt/τk)
+            # cap to relaxed target (relax-up)
+            if RH_star is not None:
+                Wstar = W_from_RH_T(RH_star, tair[i], p_atm)
+                Wnew  = min(Wnew, Wstar)
+            Wnew = clamp_W(Wnew, tair[i])
+            W = Wnew
+            W_series.append(W)
+            continue
 
-        dWdt = (m_evap + m_sink) / m_air
-        W = W + dWdt * dt[i]
-        # cap to relaxed target instantaneously (relax-up assumed)
-        if RH_star is not None:
-            Wstar = W_from_RH_T(RH_star, tair[i], p_atm)
-            W = min(W, Wstar)
+        # ----- nonlinear evaporation: adaptive sub-step + clamps -----
+        # local linear slope for tau estimate
+        dPa_dW = p_atm * 0.622 / (0.622 + W)**2
+        k_e_loc = C_EVAP * POOL_AREA_M2 * F_A * dPa_dW
+        denom = (mvent[i] + k_e_loc)
+        τloc = m_air/denom if denom > 1e-12 else np.inf
+        dt_target = min(MAX_SUBSTEP_S, (τloc/5.0) if np.isfinite(τloc) else MAX_SUBSTEP_S, Δt)
+        n_sub = max(1, int(math.ceil(Δt / dt_target)))
+        dt_sub = Δt / n_sub
+
+        for _ in range(n_sub):
+            Pa    = Pv_from_W(W, p_atm)
+            m_ev  = C_EVAP * POOL_AREA_M2 * (Pw - Pa) * F_A
+            m_sink= mvent[i] * (wsup[i] - W)
+            dWdt  = (m_ev + m_sink) / m_air
+            W     = W + dWdt * dt_sub
+            # cap upward & clamp physical range
+            if RH_star is not None:
+                Wstar = W_from_RH_T(RH_star, tair[i], p_atm)
+                W = min(W, Wstar)
+            W = clamp_W(W, tair[i])
+
         W_series.append(W)
 
     return np.array(tsec), np.array(W_series), m_air
@@ -251,9 +297,8 @@ def fit_tau_Winf_from_trace(times: pd.Series, W: pd.Series):
         return np.nan, np.nan
     y = np.log( (Wv[valid] - Winf_guess) / (Wv[0] - Winf_guess) )
     x = t[valid]
-    # least squares slope
     A = np.vstack([x, np.ones_like(x)]).T
-    slope, _ = np.linalg.lstsq(A, y, rcond=None)[0]  # y ≈ slope*x + c
+    slope, _ = np.linalg.lstsq(A, y, rcond=None)[0]
     tau_fit = -1.0/slope if slope < 0 else np.nan
     return tau_fit, Winf_guess
 
@@ -274,7 +319,6 @@ def main():
         Tair_bar  = float(win["T_room_C"].mean())
         Tw_bar    = POOL_WATER_T_C
 
-        # choose constant inputs for the linear/avg reference
         if USE_AVG_FLOW and "m_ret" in win:
             mvent_bar = float(0.5*(win["m_sup"]+win["m_ret"]).mean())
         else:
@@ -282,7 +326,7 @@ def main():
         Wsup_bar  = float(win["w_sup"].mean())
         dt_h = (t1-t0).total_seconds()/3600.0
 
-        # --- Model prediction (choose path by toggles) ---
+        # --- Model prediction (respect toggles) ---
         if USE_TIME_VARYING:
             tsec, W_series, m_air = simulate_event_timevary(
                 win, W0, Tair_bar, Tw_bar, RELAXED_RH_STAR,
@@ -291,10 +335,9 @@ def main():
             Wend_model = float(W_series[-1])
             dW_model   = Wend_model - W0
             Q_model    = h_fg_J_per_kg(Tair_bar) * m_air * dW_model / 3.6e6
-            # for reporting, define an effective tau using mean(m_vent)
             k_e = ke_from_W0(W0)
             tau_eff = m_air / (mvent_bar + k_e) if (mvent_bar + k_e) > 0 else np.inf
-            Winf_model = np.nan  # not unique under time-varying inputs
+            Winf_model = np.nan
         else:
             res = model_event_linear_avg(W0, Wsup_bar, mvent_bar, Tair_bar, Tw_bar, dt_h,
                                          RH_star=RELAXED_RH_STAR, p_atm=PRESSURE_PA)
@@ -302,7 +345,7 @@ def main():
             tau_eff = res["tau"]; Winf_model = res["Winf"]
             Wend_model = res["Wend"]; dW_model = res["dW_ach"]; Q_model = res["Qlatent_kWh"]
 
-        # --- "Truth" from IDA ICE over the same window (with same cap) ---
+        # --- "Truth" from IDA over the same window (with same cap) ---
         W_end_ice = float(win["w_ret"].iloc[-1])
         if RELAXED_RH_STAR is not None:
             W_star = W_from_RH_T(RELAXED_RH_STAR, Tair_bar, PRESSURE_PA)
@@ -310,12 +353,8 @@ def main():
         dW_ice = W_end_ice - W0
         Q_ice  = h_fg_J_per_kg(Tair_bar) * m_air * dW_ice / 3.6e6
 
-        # --- Fit tau, Winf, ke from IDA trace (diagnostics) ---
         tau_fit_s, Winf_fit = fit_tau_Winf_from_trace(win["time"], win["w_ret"])
-        if np.isfinite(tau_fit_s):
-            ke_fit = (m_air / tau_fit_s) - mvent_bar
-        else:
-            ke_fit = np.nan
+        ke_fit = (m_air / tau_fit_s) - mvent_bar if np.isfinite(tau_fit_s) else np.nan
 
         rows.append({
             "t0": t0, "t1": t1, "dt_h": dt_h,
@@ -348,26 +387,33 @@ def main():
     print(f"Mean |Q error| (kWh): {out['Q_error_kWh'].abs().mean():.3f}")
     print(f"Median tau_fit (min): {np.nanmedian(out['tau_fit_min']):.2f} | Median k_e_fit: {np.nanmedian(out['k_e_fit']):.3e}")
 
+    # ---- Average total latent storage per day (IDA vs Model) ----
+    out["day"] = pd.to_datetime(out["t0"]).dt.date
+    daily = out.groupby("day").agg(
+        Q_IDA_day_kWh=("Q_latent_IDA_kWh", "sum"),
+        Q_model_day_kWh=("Q_latent_model_kWh", "sum"),
+        n_events=("t0", "count")
+    ).reset_index()
+    avg_ida_day   = float(daily["Q_IDA_day_kWh"].mean()) if not daily.empty else float("nan")
+    avg_model_day = float(daily["Q_model_day_kWh"].mean()) if not daily.empty else float("nan")
+    print(f"Days covered: {len(daily)} (avg events/day = {daily['n_events'].mean():.2f})")
+    print(f"Average total latent storage per day — IDA ICE: {avg_ida_day:.3f} kWh/day")
+    print(f"Average total latent storage per day — Model  : {avg_model_day:.3f} kWh/day")
+
     if not PLOTS_SHOW:
         return
 
-    # ====================== ADDED BLOCK: Average RH across the event window ======================
-    BIN_MIN = 10  # bin width in minutes (5–15 works well)
-
-    avg_records = []  # {bin, RH_ida, RH_model}
+    # ---- Average RH across the event window (pooled) ----
+    BIN_MIN = 10
+    avg_records = []
     for _, r in out.iterrows():
         t0, t1 = pd.to_datetime(r["t0"]), pd.to_datetime(r["t1"])
         win = df[(df["time"] >= t0) & (df["time"] <= t1)].copy()
         if win.empty:
             continue
-
-        # relative time in minutes from event start
         rel_min = (win["time"] - t0).dt.total_seconds().values / 60.0
 
-        # IDA RH from room W and T at each timestamp
         RH_ida = [100.0 * RH_from_W_T(w, T) for w, T in zip(win["w_ret"].values, win["T_room_C"].values)]
-
-        # Model RH at the same timestamps (respect toggles)
         if USE_TIME_VARYING:
             tsec, W_series, _ = simulate_event_timevary(
                 win, r["W0"], r["Tair_bar_C"], POOL_WATER_T_C, RELAXED_RH_STAR,
@@ -383,7 +429,6 @@ def main():
                 W_model = np.minimum(W_model, np.array(Wstar))
             RH_model = [100.0 * RH_from_W_T(w, T) for w, T in zip(W_model, win["T_room_C"].values)]
 
-        # bin and store
         bins = (rel_min // BIN_MIN).astype(int) * BIN_MIN
         for b, rhi, rhm in zip(bins, RH_ida, RH_model):
             avg_records.append({"bin": int(b), "RH_ida": float(rhi), "RH_model": float(rhm)})
@@ -412,7 +457,6 @@ def main():
         plt.show()
     else:
         print("Average RH plot: no records were collected (check events/windows).")
-    # ==================== END ADDED BLOCK: Average RH across the event window ====================
 
     # ---- scatter ΔW ----
     fig, ax = plt.subplots()
@@ -454,7 +498,6 @@ def main():
         if win.empty:
             continue
 
-        # model trajectory (respect toggles)
         if USE_TIME_VARYING:
             tsec, W_series, _ = simulate_event_timevary(
                 win, r["W0"], r["Tair_bar_C"], POOL_WATER_T_C, RELAXED_RH_STAR,
@@ -462,10 +505,10 @@ def main():
             )
             Wm = W_series
         else:
-            τ = (r["tau_model_min"]*60.0) if np.isfinite(r["tau_model_min"]) else 1e12
+            tau_s = (r["tau_model_min"]*60.0) if np.isfinite(r["tau_model_min"]) else 1e12
             Winf = r["Winf_model"]; W0 = r["W0"]
             tsec = (win["time"] - win["time"].iloc[0]).dt.total_seconds().values
-            Wm = Winf + (W0 - Winf)*np.exp(-tsec/τ)
+            Wm = Winf + (W0 - Winf)*np.exp(-tsec/tau_s)
 
         RH_ida = [100*RH_from_W_T(w, T) for w,T in zip(win["w_ret"].values, win["T_room_C"].values)]
         RH_mod = [100*RH_from_W_T(w, T) for w,T in zip(Wm, win["T_room_C"].values)]
