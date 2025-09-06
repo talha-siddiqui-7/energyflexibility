@@ -33,12 +33,12 @@ POOL_AREA_M2 = 100.0
 
 # Event definition
 START_HOUR  = 20
-DURATION_H  = 6
+DURATION_H  = 3
 EXPLICIT_EVENTS = []
 
 # ------------------------- TOGGLES -------------------------
 USE_TIME_VARYING = True    # use W_sup(t), m_vent(t) within window
-USE_NONLINEAR    = True    # exact evaporation law (else linearized)
+USE_NONLINEAR    = False    # exact evaporation law (else linearized)
 USE_AVG_FLOW     = False   # m_vent = 0.5*(m_sup+m_ext) else m_sup
 PLOTS_SHOW       = True
 
