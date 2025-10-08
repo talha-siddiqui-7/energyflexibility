@@ -25,7 +25,7 @@ OUTPUT_PER_NIGHT = r"M:\PhD\02 Data sets from simulations\Air Flexibility\true_s
 # ------------------------- SITE / MODEL SETTINGS -------------------------
 VOLUME_M3       = 19.65 * 13.8 * 4.95
 PRESSURE_PA     = 101325.0
-RELAXED_RH_STAR = 0.58
+RELAXED_RH_STAR = 0.65
 POOL_WATER_T_C  = 28.0
 C_EVAP = 4.0e-8          # kg/(s·m²·Pa)  (calibrate once on a clean event)
 F_A    = 0.5
@@ -33,13 +33,13 @@ POOL_AREA_M2 = 100.0
 
 # Event definition
 START_HOUR  = 20
-DURATION_H  = 3
+DURATION_H  = 6
 EXPLICIT_EVENTS = []
 
 # ------------------------- TOGGLES -------------------------
-USE_TIME_VARYING = True    # use W_sup(t), m_vent(t) within window
+USE_TIME_VARYING = False    # use W_sup(t), m_vent(t) within window
 USE_NONLINEAR    = False    # exact evaporation law (else linearized)
-USE_AVG_FLOW     = False   # m_vent = 0.5*(m_sup+m_ext) else m_sup
+USE_AVG_FLOW     = True     # m_vent = 0.5*(m_sup+m_ext) else m_sup
 PLOTS_SHOW       = True
 
 # ---- Stability controls for nonlinear path ----
@@ -242,7 +242,6 @@ def simulate_event_timevary(win: pd.DataFrame, W0: float, Tair_bar: float, Tw_ba
             continue
 
         # ----- nonlinear evaporation: adaptive sub-step + clamps -----
-        # local linear slope for tau estimate
         dPa_dW = p_atm * 0.622 / (0.622 + W)**2
         k_e_loc = C_EVAP * POOL_AREA_M2 * F_A * dPa_dW
         denom = (mvent[i] + k_e_loc)
@@ -343,7 +342,7 @@ def main():
                                          RH_star=RELAXED_RH_STAR, p_atm=PRESSURE_PA)
             k_e = res["k_e"]; m_air = res["m_air"]
             tau_eff = res["tau"]; Winf_model = res["Winf"]
-            Wend_model = res["Wend"]; dW_model = res["dW_ach"]; Q_model = res["Qlatent_kWh"]
+            Wend_model = res["Wend"]; dW_model = res["dW_ach"]; Q_model = res["Qlatent_KWh"] if "Qlatent_KWh" in res else res["Qlatent_kWh"]
 
         # --- "Truth" from IDA over the same window (with same cap) ---
         W_end_ice = float(win["w_ret"].iloc[-1])
@@ -438,18 +437,12 @@ def main():
         g = avg_df.groupby("bin").agg(
             RH_ida_mean=("RH_ida", "mean"),
             RH_model_mean=("RH_model", "mean"),
-            RH_ida_p25=("RH_ida", lambda s: np.percentile(s, 25)),
-            RH_ida_p75=("RH_ida", lambda s: np.percentile(s, 75)),
-            RH_model_p25=("RH_model", lambda s: np.percentile(s, 25)),
-            RH_model_p75=("RH_model", lambda s: np.percentile(s, 75)),
             n=("RH_ida", "count")
         ).reset_index()
 
         fig, ax = plt.subplots()
-        ax.plot(g["bin"], g["RH_ida_mean"], lw=2, label=f"IDA ICE (mean, n={int(g['n'].sum())})")
-        ax.fill_between(g["bin"], g["RH_ida_p25"], g["RH_ida_p75"], alpha=0.15, label="IDA IQR (25–75%)")
+        ax.plot(g["bin"], g["RH_ida_mean"], lw=2, label="IDA ICE (mean)")
         ax.plot(g["bin"], g["RH_model_mean"], "--", lw=2, label="Model (mean)")
-        ax.fill_between(g["bin"], g["RH_model_p25"], g["RH_model_p75"], alpha=0.15, label="Model IQR (25–75%)")
         ax.set_xlabel(f"Minutes from event start (bin = {BIN_MIN} min)")
         ax.set_ylabel("Relative Humidity (%)")
         ax.set_title("Average RH across the event window — IDA vs Model")
@@ -473,9 +466,9 @@ def main():
     xy = np.concatenate([out["Q_latent_IDA_kWh"].values, out["Q_latent_model_kWh"].values])
     lo, hi = np.nanmin(xy), np.nanmax(xy); pad = 0.05*(hi-lo+1e-12)
     ax.plot([lo-pad, hi+pad], [lo-pad, hi+pad], "k--", lw=1)
-    rmse = np.sqrt(np.nanmean((out["Q_error_kWh"])**2))
     ax.set_xlabel("Q_latent from IDA ICE (kWh)"); ax.set_ylabel("Q_latent from model (kWh)")
-    ax.set_title(f"Event Q_latent: model vs IDA ICE — RMSE={rmse:.3f} kWh"); ax.grid(True)
+    ax.set_title("Event Q_latent: model vs IDA ICE (1:1 dashed)")
+    ax.grid(True)
 
     # ---- histogram rel error ----
     fig, ax = plt.subplots()
