@@ -10,7 +10,7 @@ from pathlib import Path
 # -------------------------------------------------------------------------
 # 1️⃣  USER SETTINGS
 # -------------------------------------------------------------------------
-input_file = Path(r"M:\PhD\03 Experiments\EXPORT_16-09-2025_13-10-2025.csv")
+input_file = Path(r"M:\PhD\03 Experiments\Complete_17-09-2025_16-10-2025.csv")
 output_prefix = input_file.with_name(input_file.stem + "_formatted")
 
 # -------------------------------------------------------------------------
