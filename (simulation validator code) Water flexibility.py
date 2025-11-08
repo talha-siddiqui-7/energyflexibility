@@ -58,14 +58,14 @@ EXPLICIT_EVENTS = []  # e.g. ["2025-01-10 20:00", "2025-01-28 20:00"]
 PLOTS_SHOW = True
 
 # ------------------------- MODEL TOGGLES -------------------------
-USE_TIME_VARYING = True     # dynamic step-by-step vs constant-window closed form
+USE_TIME_VARYING = False     # dynamic step-by-step vs constant-window closed form
 USE_EVAP_EXACT   = False    # exact evap each step; else linearized around T0 (constant path uses mean)
-USE_ROOM_TRACK   = True     # room air follows T_pool - 1 K inside window (approx)
+USE_ROOM_TRACK   = False     # room air follows T_pool - 1 K inside window (approx)
 USE_CONV_FROM_VEL= False     # if False and H_FIXED_WM2K is set, use the fixed h; else velocity correlation
 CAP_TMAX = None             # e.g. 32.0 to cap pool temp
 
 # New toggle: use improved dynamic integrator with calibration
-USE_CALIBRATED_DYNAMIC = True
+USE_CALIBRATED_DYNAMIC = False
 
 # Calibrated scaling knobs (used only if USE_CALIBRATED_DYNAMIC = True)
 ALPHA_P   = 0.90   # scale on heater power (net to pool)

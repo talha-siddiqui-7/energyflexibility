@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Experimental validation of air flexibility model (balanced vs explicit flows + optional infiltration)
----------------------------------------------------------------------------------------------------
+Air flexibility validation: Pure External vs Pure AHU runs
+- Balanced vs explicit ventilation (toggle)
+- Optional infiltration (toggle)
+- Robust datetime handling + safe interpolation
+- Per-event metrics in kWh (MAE, RMSE, ΔQ_final)
 
-Moisture ODE (dry-air basis for mixing):
-Balanced (legacy):
-  dW/dt = [ m_evap(W)
-          + m_vent_dry*(w_sup - W)
-          + (INFILTRATION_ON ? m_inf_dry*(w_inf - W) : 0) ] / m_air
-
-Explicit (recommended when AHU is imbalanced):
-  dW/dt = (1/m_air)*[
-            m_evap
-          + m_sup_dry*(w_sup - W)
-          + (INFILTRATION_ON ? m_inf_dry*(w_inf - W) : 0)
-          - (m_ext_dry - m_sup_dry - m_inf_dry)*W
-        ]
+Dataset columns expected:
+(datetime, date, time, Air_exhaust, Extract_air_RH_sensor, Extract_air_Temp_sensor,
+ Extract_air_Temp_AHU, Extract_air_RH_AHU, Outdoor_RH, Outdoor_Temp, Pool_OF,
+ Supply_air_temp_sensor, Supply_air_RH_sensor, Supply_air_RH_AHU, Technical_area,
+ AHU Peak W, AHU Average W, Supply air flow rate (cb.m/hr),
+ Extract air flow rate (cb.m/hr), Setpoint Pool water temperature, Setpoint RH,
+ Fresh air damper, Vdot_sup_m3s, Vdot_ext_m3s, rho_sup, rho_ext, w_sup, w_ext, w_out,
+ mdot_sup_moist, mdot_ext_moist, mdot_sup_dry, mdot_ext_dry, inf_moist_kg_s,
+ inf_dry_kg_s, inf_dry_from_water_kg_s)
 """
 
 import pandas as pd
@@ -27,23 +26,26 @@ import matplotlib.pyplot as plt
 # --------------------- USER SETTINGS ------------------------
 # ============================================================
 
-DATA_CSV_PATH = r"M:\PhD\03 Experiments\Complete_17-09-2025_16-10-2025_with_AHU_power_infiltration.csv"
+DATA_CSV_PATH = r"M:\PhD\03 Experiments\17-09-2025_16-10-2025_sensor_vs_AHU_data.csv"
 
-# Toggles
-INFILTRATION_ON   = True    # set False to disable infiltration term
-USE_BALANCED_VENT = False   # True = legacy averaged flow; False = explicit supply/extract with imbalance term
+# Which modes to run (order matters in output/plots)
+RUN_MODES = ["external", "ahu"]   # choose any subset: ["external"], ["ahu"], or both
+
+# Core physics toggles
+INFILTRATION_ON   = True     # include infiltration mixing term
+USE_BALANCED_VENT = False    # True: legacy average flow; False: explicit supply/extract with imbalance
 
 # Geometry / constants
 VOLUME_M3    = 19.65 * 13.8 * 4.95
 PRESSURE_PA  = 101325.0
 POOL_AREA_M2 = 100.0
-C_EVAP_BASE  = 4.0e-8   # kg/(s·m²·Pa) before activity factor
+C_EVAP_BASE  = 4.0e-8   # kg/(s·m²·Pa) base evaporation coefficient
 
 # Activity factor knobs
-ACTIVITY_FACTOR_DEFAULTS = {"cover_on": 0.15, "cover_off": 0.25}
+ACTIVITY_FACTOR_DEFAULTS = {"cover_on": 0.15, "cover_off": 0.5}
 AF_GLOBAL_SCALE = 1.0
 
-# Events
+# Events to simulate
 EVENT_DEFINITIONS = [
     {"start_ts": "2025-09-17 22:31", "end_ts": "2025-09-17 23:01", "cover": "cover_on",  "RH_target_pct": 65.0},
     {"start_ts": "2025-09-18 00:20", "end_ts": "2025-09-18 00:41", "cover": "cover_off", "RH_target_pct": 70.0},
@@ -53,6 +55,7 @@ EVENT_DEFINITIONS = [
     {"start_ts": "2025-09-17 23:59", "end_ts": "2025-09-18 00:13", "cover": "cover_off", "RH_target_pct": 70.0},
 ]
 
+# Plot / solver
 PLOTS_SHOW     = True
 MAX_SUBSTEP_S  = 60.0
 CLAMP_ENABLED  = True
@@ -87,6 +90,7 @@ def _pick_time_col(df):
         return lowers["datetime"]
     if "date" in lowers and "time" in lowers:
         return ("__COMBINE_DATE_TIME__", lowers["date"], lowers["time"])
+    # heuristic fallback
     best, best_frac = None, 0.0
     for c in cols:
         s = pd.to_datetime(df[c], errors="coerce", dayfirst=True)
@@ -116,119 +120,147 @@ def dec_col(df, col):
 def load_experiment_csv(path):
     df_raw = pd.read_csv(path)
 
-    # build datetime (keep integer index until after assignments)
+    # Build datetime, drop NaT and duplicates
     sel = _pick_time_col(df_raw)
     if isinstance(sel, tuple) and sel[0] == "__COMBINE_DATE_TIME__":
         _, date_col, clock_col = sel
         time = _parse_datetime_series(
             df_raw[date_col].astype(str).str.strip() + " " + df_raw[clock_col].astype(str).str.strip()
-        ).dt.round("min")
+        )
     else:
-        time = _parse_datetime_series(df_raw[sel]).dt.round("min")
-    if time.isna().all():
-        raise ValueError("Datetime parsing failed.")
+        time = _parse_datetime_series(df_raw[sel])
+
+    time = time.dt.round("min")
+    ok = time.notna()
+    if not ok.all():
+        df_raw = df_raw.loc[ok].copy()
+        time   = time.loc[ok]
+    dup = time.duplicated()
+    if dup.any():
+        df_raw = df_raw.loc[~dup].copy()
+        time   = time.loc[~dup]
 
     df = pd.DataFrame({"time": time})
 
-    # explicit mapping per your labels
-    temp_col = "Extract_air_Temp"
-    rh_col   = "Extract_air_RH"
+    # --- Map required columns (exact names you provided) ---
+    # Extract (room probe) and AHU extract
+    df["T_ext_room"]   = dec_col(df_raw, "Extract_air_Temp_sensor").values
+    df["RH_ext_room"]  = dec_col(df_raw, "Extract_air_RH_sensor").values
+    df["T_ext_AHU"]    = dec_col(df_raw, "Extract_air_Temp_AHU").values
+    df["RH_ext_AHU"]   = dec_col(df_raw, "Extract_air_RH_AHU").values
 
-    # assign by position (.values) to avoid index-alignment NaNs
-    df["T_room_C"]     = dec_col(df_raw, temp_col).values
-    df["RH_room_pct"]  = dec_col(df_raw, rh_col).values
-    df["T_sup_C"]      = dec_col(df_raw, "Supply_air_temp").values
-    df["RH_sup_pct"]   = dec_col(df_raw, "Supply_air_RH").values
-    df["Pool_water_C"] = dec_col(df_raw, "Pool_OF").values
+    # Supply (assume temp sensor is AHU duct temp)
+    df["T_sup"]        = dec_col(df_raw, "Supply_air_temp_sensor").values
+    df["RH_sup_room"]  = dec_col(df_raw, "Supply_air_RH_sensor").values
+    df["RH_sup_AHU"]   = dec_col(df_raw, "Supply_air_RH_AHU").values
 
-    # optional cb.m/hr (not used in ODE)
-    sup_flow_m3ph = dec_col(df_raw, "Supply air flow rate (cb.m/hr)").values
-    ret_flow_m3ph = dec_col(df_raw, "Extract air flow rate (cb.m/hr)").values
+    # Water & outdoor
+    df["T_pool"]       = dec_col(df_raw, "Pool_OF").values
+    df["RH_outdoor"]   = dec_col(df_raw, "Outdoor_RH").values
+    df["T_outdoor"]    = dec_col(df_raw, "Outdoor_Temp").values
 
-    # density for conversion (legacy; not used in ODE now)
-    w_ret_initial = np.array([
-        W_from_RH_T(rh/100, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
-        for rh, T in zip(df["RH_room_pct"], df["T_room_C"])
-    ])
-    rho_air = np.array([
-        rho_da_from_wT(w if np.isfinite(w) else 0.01, T if np.isfinite(T) else 25)
-        for w, T in zip(w_ret_initial, df["T_room_C"])
-    ])
-    df["m_sup"] = (sup_flow_m3ph / 3600.0) * rho_air
-    df["m_ret"] = (ret_flow_m3ph / 3600.0) * rho_air
+    # Provided humidity ratios and (dry-air) mass flows
+    df["w_sup_file"]   = dec_col(df_raw, "w_sup").values
+    df["w_ext_file"]   = dec_col(df_raw, "w_ext").values
+    df["w_out"]        = dec_col(df_raw, "w_out").values
+    df["m_sup_dry"]    = dec_col(df_raw, "mdot_sup_dry").values
+    df["m_ext_dry"]    = dec_col(df_raw, "mdot_ext_dry").values
+    df["m_inf_dry"]    = dec_col(df_raw, "inf_dry_kg_s").fillna(0.0).values
 
-    # infiltration / dry-air mass flows (kg/s, already dry-air in your unified file)
-    df["w_sup"]      = dec_col(df_raw, "w_sup").values
-    df["w_ret_meas"] = dec_col(df_raw, "w_ext").values
-    df["w_inf"]      = dec_col(df_raw, "w_out").values
-    df["m_sup_dry"]  = dec_col(df_raw, "mdot_sup_dry").values
-    df["m_ext_dry"]  = dec_col(df_raw, "mdot_ext_dry").values   # renamed for clarity
-    df["m_inf_dry"]  = dec_col(df_raw, "inf_dry_kg_s").fillna(0.0).values
-
-    # now set time index + interpolate
+    # Set tidy index + robust interpolation
     df = df.sort_values("time").set_index("time")
-    for c in ["T_room_C","RH_room_pct","T_sup_C","RH_sup_pct","Pool_water_C",
-              "m_sup","m_ret","w_sup","w_ret_meas","w_inf","m_sup_dry","m_ext_dry","m_inf_dry"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-        df[c] = df[c].interpolate(method="time").ffill().bfill()
 
-    print(f"[column map] T_room_C <- '{temp_col}', RH_room_pct <- '{rh_col}'")
+    def _safe_time_interpolate(s):
+        s = pd.to_numeric(s, errors="coerce")
+        try:
+            return s.interpolate(method="time").ffill().bfill()
+        except Exception:
+            return s.interpolate(method="linear", limit_direction="both").ffill().bfill()
+
+    for c in df.columns:
+        df[c] = _safe_time_interpolate(df[c])
+
+    # Build humidity ratios from RH+T pairs (pure sources)
+    df["w_ext_room"] = [W_from_RH_T(rh/100.0, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
+                        for rh, T in zip(df["RH_ext_room"], df["T_ext_room"])]
+    df["w_ext_ahu"]  = [W_from_RH_T(rh/100.0, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
+                        for rh, T in zip(df["RH_ext_AHU"],  df["T_ext_AHU"])]
+    df["w_sup_room"] = [W_from_RH_T(rh/100.0, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
+                        for rh, T in zip(df["RH_sup_room"], df["T_sup"])]
+    df["w_sup_ahu"]  = [W_from_RH_T(rh/100.0, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
+                        for rh, T in zip(df["RH_sup_AHU"],  df["T_sup"])]
+
+    # Final fill for computed series
+    for c in ["w_ext_room","w_ext_ahu","w_sup_room","w_sup_ahu"]:
+        df[c] = _safe_time_interpolate(df[c])
+
+    print("[OK] Columns mapped and humidities built (room/AHU).")
     return df.reset_index()
 
 # ============================================================
 # ---------------- SIMULATION CORE ---------------------------
 # ============================================================
 
-def simulate_window(win, RH_target_frac, activity_factor, use_infiltration=True, use_balanced=True):
-    """
-    Stable time-stepping. If use_infiltration=False, infiltration term is disabled.
-    If use_balanced=True, uses m_vent_dry = 0.5*(m_sup_dry + m_ext_dry).
-    Else, uses explicit supply/extract and an imbalance term.
-    """
-    tair    = win["T_room_C"].values
-    RH_meas = (win["RH_room_pct"].values / 100).clip(0, 1)
-    T_sup   = win["T_sup_C"].values
-    RH_sup  = (win["RH_sup_pct"].values / 100).clip(0, 1)
-    Twater  = win["Pool_water_C"].values
+def _series_to_RH_pct(W_series, T_series):
+    return np.array([100.0 * RH_from_W_T(w, T) if np.isfinite(w) and np.isfinite(T) else np.nan
+                     for w, T in zip(W_series, T_series)])
 
-    # humidity ratios
-    if "w_ret_meas" in win.columns and np.isfinite(win["w_ret_meas"]).any():
-        W_meas_series = win["w_ret_meas"].values.astype(float)
+def _latent_Q_kWh(W_series, W0, m_air, T_series):
+    T_mean = float(np.nanmean(T_series))
+    hfg = h_fg_J_per_kg(T_mean)
+    return hfg * m_air * (W_series - W0) / 3.6e6
+
+def pick_inputs_for_mode(win, mode):
+    """Return dict of inputs for 'external' or 'ahu' run."""
+    assert mode in ("external","ahu")
+    if mode == "external":
+        return dict(
+            W_init = win["w_ext_room"].values.astype(float),
+            w_sup  = (win["w_sup_file"].values.astype(float)
+                      if np.isfinite(win["w_sup_file"]).any() else win["w_sup_room"].values.astype(float)),
+            W_meas = win["w_ext_room"].values.astype(float),  # metrics reference
+            tag    = "EXT"
+        )
     else:
-        W_meas_series = np.array([W_from_RH_T(rh, T) if np.isfinite(rh) and np.isfinite(T) else np.nan
-                                  for rh, T in zip(RH_meas, tair)], dtype=float)
+        return dict(
+            W_init = win["w_ext_ahu"].values.astype(float),
+            w_sup  = win["w_sup_ahu"].values.astype(float),
+            W_meas = win["w_ext_ahu"].values.astype(float),   # metrics reference
+            tag    = "AHU"
+        )
 
-    if "w_sup" in win.columns and np.isfinite(win["w_sup"]).any():
-        w_sup = win["w_sup"].values.astype(float)
-    else:
-        w_sup = np.array([W_from_RH_T(rh, Ts) if np.isfinite(rh) and np.isfinite(Ts) else np.nan
-                          for rh, Ts in zip(RH_sup, T_sup)], dtype=float)
-
-    w_inf = (win["w_inf"].values.astype(float)
-             if "w_inf" in win.columns else np.copy(w_sup))
+def simulate_window(win, RH_target_frac, activity_factor, mode, use_infiltration=True, use_balanced=True):
+    """Run one window in a given mode ('external' or 'ahu')."""
+    tair    = win["T_ext_room"].values   # room air temperature path (state T)
+    Twater  = win["T_pool"].values
+    w_inf   = win["w_out"].values if "w_out" in win.columns else win["w_sup_room"].values
 
     # dry-air flows
-    m_sup_dry = win["m_sup_dry"].values.astype(float) if "m_sup_dry" in win.columns else np.zeros_like(w_sup)
-    m_ext_dry = win["m_ext_dry"].values.astype(float) if "m_ext_dry" in win.columns else np.zeros_like(w_sup)
-    m_inf_dry = win["m_inf_dry"].values.astype(float) if "m_inf_dry" in win.columns else np.zeros_like(w_sup)
+    m_sup_dry = win["m_sup_dry"].values.astype(float) if "m_sup_dry" in win.columns else np.zeros_like(tair)
+    m_ext_dry = win["m_ext_dry"].values.astype(float) if "m_ext_dry" in win.columns else np.zeros_like(tair)
+    m_inf_dry = win["m_inf_dry"].values.astype(float) if "m_inf_dry" in win.columns else np.zeros_like(tair)
     if not use_infiltration:
         m_inf_dry = np.zeros_like(m_inf_dry)
 
-    # guard
-    if not (len(W_meas_series) and np.isfinite(W_meas_series[0]) and np.isfinite(tair[0])):
-        return {"tsec": np.array([]), "W_series": np.array([]),
-                "m_air": np.nan, "W0": np.nan, "tair": tair, "RH_meas": np.array([])}
+    # pick pure inputs by mode
+    sel = pick_inputs_for_mode(win, mode)
+    W0_series = sel["W_init"]
+    w_sup     = sel["w_sup"]
+    W_meas    = sel["W_meas"]
+    metric_tag= sel["tag"]
 
-    # initial state and air mass
-    W0    = float(W_meas_series[0])
-    m_air = rho_da_from_wT(W0, tair[0]) * VOLUME_M3
+    # initial state
+    if not len(W0_series) or not np.isfinite(W0_series[0]) or not np.isfinite(tair[0]):
+        return {"ok": False}
 
-    tsec  = (win["time"] - win["time"].iloc[0]).dt.total_seconds().values
-    dt    = np.diff(tsec, prepend=tsec[0])
-    Pw    = np.array([psat_pa(Tw) for Tw in Twater])
+    W0   = float(W0_series[0])
+    m_air= rho_da_from_wT(W0, tair[0]) * VOLUME_M3
 
-    W = float(W0)
-    W_series = [W0]
+    tsec = (win["time"] - win["time"].iloc[0]).dt.total_seconds().values
+    dt   = np.diff(tsec, prepend=tsec[0])
+    Pw   = np.array([psat_pa(Tw) for Tw in Twater])
+
+    W = float(W0); W_series = [W0]
 
     for i in range(1, len(tsec)):
         dti = float(dt[i])
@@ -236,18 +268,17 @@ def simulate_window(win, RH_target_frac, activity_factor, use_infiltration=True,
             W_series.append(W); continue
 
         dPa_dW = PRESSURE_PA * 0.622 / (0.622 + W)**2
-        k_e = (C_EVAP_BASE * activity_factor) * POOL_AREA_M2 * dPa_dW
+        k_e    = (C_EVAP_BASE * activity_factor) * POOL_AREA_M2 * dPa_dW
 
         if use_balanced:
-            m_vent_dry = 0.5 * (m_sup_dry[i] + m_ext_dry[i]) if np.isfinite(m_sup_dry[i]) and np.isfinite(m_ext_dry[i]) else 0.0
-            mi = m_inf_dry[i] if np.isfinite(m_inf_dry[i]) else 0.0
-            # step-size denominator (positive contributions)
-            denom = max(m_vent_dry, 0.0) + max(mi, 0.0) + k_e
+            m_vent = 0.5 * (m_sup_dry[i] + m_ext_dry[i]) if np.isfinite(m_sup_dry[i]) and np.isfinite(m_ext_dry[i]) else 0.0
+            mi     = m_inf_dry[i] if np.isfinite(m_inf_dry[i]) else 0.0
+            denom  = max(m_vent,0.0) + max(mi,0.0) + k_e
         else:
             ms = m_sup_dry[i] if np.isfinite(m_sup_dry[i]) else 0.0
             me = m_ext_dry[i] if np.isfinite(m_ext_dry[i]) else 0.0
             mi = m_inf_dry[i] if np.isfinite(m_inf_dry[i]) else 0.0
-            denom = max(ms, 0.0) + max(me, 0.0) + max(mi, 0.0) + k_e
+            denom = max(ms,0.0) + max(me,0.0) + max(mi,0.0) + k_e
 
         tau = m_air / denom if denom > 1e-12 else np.inf
         dt_target = min(MAX_SUBSTEP_S, (tau/5.0) if np.isfinite(tau) else MAX_SUBSTEP_S, dti)
@@ -269,13 +300,7 @@ def simulate_window(win, RH_target_frac, activity_factor, use_infiltration=True,
                 ms = m_sup_dry[i] if np.isfinite(m_sup_dry[i]) else 0.0
                 me = m_ext_dry[i] if np.isfinite(m_ext_dry[i]) else 0.0
                 mi = m_inf_dry[i] if np.isfinite(m_inf_dry[i]) else 0.0
-                # explicit supply/extract with imbalance term
-                rhs = (
-                    m_ev
-                    + ms*(ws - W)
-                    + mi*(wi - W)
-                    - (me - ms - mi)*W
-                )
+                rhs = m_ev + ms*(ws - W) + mi*(wi - W) - (me - ms - mi)*W
 
             dWdt = rhs / m_air
             W   += dWdt * dt_sub
@@ -287,11 +312,16 @@ def simulate_window(win, RH_target_frac, activity_factor, use_infiltration=True,
 
         W_series.append(W)
 
-    RH_meas_used = np.array([RH_from_W_T(w, T) if np.isfinite(w) and np.isfinite(T) else np.nan
-                             for w, T in zip(W_meas_series, tair)]).clip(0, 1)
-
-    return {"tsec": np.array(tsec), "W_series": np.array(W_series),
-            "m_air": m_air, "W0": W0, "tair": tair, "RH_meas": RH_meas_used}
+    return {
+        "ok": True,
+        "tsec": np.array(tsec),
+        "W_series": np.array(W_series),
+        "W_meas": W_meas,
+        "m_air": m_air,
+        "W0": W0,
+        "tair": tair,
+        "metric_tag": metric_tag,
+    }
 
 # ============================================================
 # ---------------- MAIN ANALYSIS -----------------------------
@@ -302,103 +332,77 @@ def _check_events_cover_data(df, events):
     inside, outside = [], []
     for i, ev in enumerate(events, start=1):
         t0, t1 = pd.to_datetime(ev["start_ts"]), pd.to_datetime(ev["end_ts"])
-        if (t1 < data_min) or (t0 > data_max):
-            outside.append((i, t0, t1))
-        else:
-            inside.append((i, t0, t1))
+        (outside if (t1 < data_min) or (t0 > data_max) else inside).append((i, t0, t1))
     return data_min, data_max, inside, outside
 
 def main():
     df_all = load_experiment_csv(DATA_CSV_PATH)
     data_min, data_max, inside, outside = _check_events_cover_data(df_all, EVENT_DEFINITIONS)
-    print(f"Data time range: {data_min} → {data_max}")
-    print(f"Infiltration toggled: {'ON' if INFILTRATION_ON else 'OFF'} | Vent model: {'BALANCED' if USE_BALANCED_VENT else 'EXPLICIT'}")
-
+    print(f"Data: {data_min} → {data_max}")
+    print(f"Infiltration: {'ON' if INFILTRATION_ON else 'OFF'} | Vent: {'BALANCED' if USE_BALANCED_VENT else 'EXPLICIT'}")
     if not inside:
-        raise RuntimeError(
-            "All events are outside the data range.\n"
-            f"- Data range: {data_min} → {data_max}\n"
-            f"- Example event: {EVENT_DEFINITIONS[0]['start_ts']} → {EVENT_DEFINITIONS[0]['end_ts']}\n"
-            "Fix: point DATA_CSV_PATH to the correct file, or update EVENT_DEFINITIONS."
-        )
+        raise RuntimeError("No events within data range.")
     if outside:
-        print("Note: these events are outside the range and will be skipped:")
-        for i, t0, t1 in outside:
-            print(f"  - Event {i}: {t0} → {t1}")
+        print("Skipping events outside range:", [i for i,_,_ in outside])
 
-    events_to_run = [EVENT_DEFINITIONS[i-1] for (i, _, _) in inside]
+    events_to_run = [EVENT_DEFINITIONS[i-1] for (i,_,_) in inside]
 
     for k, ev in enumerate(events_to_run, start=1):
         t0, t1 = pd.to_datetime(ev["start_ts"]), pd.to_datetime(ev["end_ts"])
         win = df_all[(df_all["time"] >= t0) & (df_all["time"] <= t1)].copy()
         if len(win) < 2:
-            print(f"[skip] Event {k}: {t0}→{t1} has {len(win)} rows. Check timestamps.")
-            continue
-
-        needed = ["T_room_C","RH_room_pct","w_ret_meas","w_sup","w_inf","m_sup_dry","m_ext_dry","m_inf_dry"]
-        coverage = {c: float(np.isfinite(win[c]).mean()) if c in win else 0.0 for c in needed}
-        print(f"\n[Event {k} coverage] " + ", ".join(f"{c}={coverage[c]:.2f}" for c in needed))
+            print(f"[skip] Event {k}: not enough rows"); continue
 
         base_af = ev.get("AF", ACTIVITY_FACTOR_DEFAULTS[ev["cover"]])
         act = base_af * ev.get("AF_scale", 1.0) * AF_GLOBAL_SCALE
-
         RH_target = ev["RH_target_pct"] / 100.0
-        sim = simulate_window(
-            win, RH_target, act,
-            use_infiltration=INFILTRATION_ON,
-            use_balanced=USE_BALANCED_VENT
-        )
 
-        if sim["W_series"].size == 0 or not np.isfinite(sim["W0"]):
-            print(f"[skip] Event {k}: inputs produced NaN initial state — check coverage line above.")
-            continue
+        # For plotting context: build both measured RH series
+        RH_ext_pct = _series_to_RH_pct(win["w_ext_room"].values, win["T_ext_room"].values)
+        RH_ahu_pct = _series_to_RH_pct(win["w_ext_ahu"].values,  win["T_ext_room"].values)
 
-        RH_meas_pct  = sim["RH_meas"] * 100.0
-        RH_model_pct = [100.0 * RH_from_W_T(Wm, T) for Wm, T in zip(sim["W_series"], sim["tair"])]
+        for mode in RUN_MODES:
+            sim = simulate_window(
+                win, RH_target, act, mode,
+                use_infiltration=INFILTRATION_ON,
+                use_balanced=USE_BALANCED_VENT
+            )
+            if not sim["ok"]:
+                print(f"[skip] Event {k} ({mode}): bad initial state"); continue
 
-        # latent energy trajectories
-        W0, m_air = sim["W0"], sim["m_air"]
-        T_mean = float(np.mean(sim["tair"]))
-        hfg = h_fg_J_per_kg(T_mean)
+            # RH curves
+            RH_model_pct = _series_to_RH_pct(sim["W_series"], sim["tair"])
 
-        Q_model = hfg * m_air * (sim["W_series"] - W0) / 3.6e6
-        W_meas  = np.array([W_from_RH_T(rh, T) for rh, T in zip(sim["RH_meas"], sim["tair"])])
-        Q_meas  = hfg * m_air * (W_meas - W0) / 3.6e6
+            # Latent energy metrics vs the mode's own measured series
+            Q_model = _latent_Q_kWh(sim["W_series"], sim["W0"], sim["m_air"], sim["tair"])
+            Q_meas  = _latent_Q_kWh(sim["W_meas"],  sim["W0"], sim["m_air"], sim["tair"])
+            err  = Q_model - Q_meas
+            mae  = float(np.nanmean(np.abs(err)))
+            rmse = float(np.sqrt(np.nanmean(err**2)))
+            dqf  = float(Q_model[-1] - Q_meas[-1])
 
-        # metrics
-        err  = Q_model - Q_meas
-        mae  = float(np.nanmean(np.abs(err)))
-        rmse = float(np.sqrt(np.nanmean(err**2)))
+            if not USE_BALANCED_VENT:
+                imb = float((win["m_ext_dry"] - win["m_sup_dry"] - (win["m_inf_dry"] if INFILTRATION_ON else 0.0)).mean())
+                print(f"[imbalance] Event {k} ({mode}): (me - ms - mi) = {imb:+.4f} kg/s")
 
-        Q_model_final = float(Q_model[-1])
-        Q_meas_final  = float(Q_meas[-1])
-        Q_err_final   = Q_model_final - Q_meas_final
+            print("\n======================================")
+            print(f"Event {k}: {t0} → {t1}")
+            print(f"Mode={mode.upper()} | cover={ev['cover']} | RH_target={ev['RH_target_pct']}% | AF={act:.3f}")
+            print(f"MAE={mae:.3f} kWh | RMSE={rmse:.3f} kWh | ΔQ_final={dqf:+.3f} kWh")
+            print("======================================")
 
-        # quick imbalance diagnostic for explicit mode
-        if not USE_BALANCED_VENT:
-            imbalance_mean = float((win["m_ext_dry"] - win["m_sup_dry"] - (win["m_inf_dry"] if INFILTRATION_ON else 0.0)).mean())
-            print(f"Imbalance mean (me - ms - mi) [kg/s]: {imbalance_mean:+.4f}")
-
-        print("\n======================================")
-        print(f"Event {k}: {t0} → {t1}")
-        print(f"cover = {ev['cover']} | RH_target = {ev['RH_target_pct']}% | activity_factor = {act:.3f}")
-        print(f"Infiltration: {'ON' if INFILTRATION_ON else 'OFF'} | Vent model: {'BALANCED' if USE_BALANCED_VENT else 'EXPLICIT'}")
-        print(f"Duration: {(t1 - t0).total_seconds() / 3600.0:.2f} h")
-        print(f"Model latent storage (kWh):    {Q_model_final:.3f}")
-        print(f"Measured latent storage (kWh): {Q_meas_final:.3f}")
-        print(f"MAE over time (kWh):  {mae:.3f}")
-        print(f"RMSE over time (kWh): {rmse:.3f}")
-        print(f"Latent storage error (model - meas): {Q_err_final:.3f} kWh")
-        print("======================================")
-
-        if PLOTS_SHOW:
-            plt.figure()
-            plt.plot(win["time"], RH_meas_pct, lw=2, label="Measured RH (%)")
-            plt.plot(win["time"], RH_model_pct, "--", lw=2, label="Model RH (%)")
-            plt.xlabel("Time"); plt.ylabel("RH (%)")
-            plt.title(f"Event {k}: {ev['cover']}, {ev['RH_target_pct']}% | AF={act:.2f} | Infil={'ON' if INFILTRATION_ON else 'OFF'} | Vent={'BAL' if USE_BALANCED_VENT else 'EXP'}")
-            plt.grid(True); plt.legend()
-            plt.show()
+            if PLOTS_SHOW:
+                plt.figure(figsize=(10,5))
+                plt.plot(win["time"], RH_ext_pct,  lw=2, label="Measured RH ext (%)")
+                plt.plot(win["time"], RH_ahu_pct,  lw=2, label="Measured RH AHU (%)")
+                plt.plot(win["time"], RH_model_pct, "--", lw=2, label=f"Model RH (%) [{mode.upper()} run]")
+                plt.xlabel("Time"); plt.ylabel("RH (%)")
+                plt.title(
+                    f"Event {k}: {ev['cover']}, {ev['RH_target_pct']}% | "
+                    f"AF={act:.2f} | Infil={'ON' if INFILTRATION_ON else 'OFF'} | "
+                    f"Vent={'BAL' if USE_BALANCED_VENT else 'EXP'} | Mode={mode.upper()}"
+                )
+                plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
 
 if __name__ == "__main__":
     main()
