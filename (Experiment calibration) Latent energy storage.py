@@ -57,7 +57,7 @@ USE_BALANCED_VENT   = False      # False = explicit supply/extract + imbalance t
 
 # Infiltration assumptions for adjacent rooms
 # Dry rooms (corridor, gym, guard room, etc.)
-INFIL_DRY_RH   = 0.37    # DRY rooms RH as fraction (0–1), e.g. 0.45 = 45%
+INFIL_DRY_RH   = 0.40    # DRY rooms RH as fraction (0–1), e.g. 0.45 = 45%
 INFIL_DRY_T    = 28.0    # °C, DRY rooms temperature
 
 # Moist rooms (showers/WC)
@@ -542,3 +542,30 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ============================================================
+# ----------------- EXTRA PLOT: BOX PLOTS --------------------
+# ============================================================
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    # Reload data (reuse your existing loader)
+    _df_plot = load_experiment_csv(DATA_CSV_PATH)
+
+    # Extract RH signals (already converted & cleaned in loader)
+    rh_supply  = _df_plot["RH_sup_room"].dropna().astype(float)
+    rh_extract = _df_plot["RH_ext_room"].dropna().astype(float)
+
+    plt.figure(figsize=(6, 4))
+
+    plt.boxplot(
+        [rh_supply.values, rh_extract.values],
+        labels=["Supply_air_RH_sensor", "Extract_air_RH_sensor"],
+        showmeans=True
+    )
+
+    plt.ylabel("Relative Humidity [%]")
+    plt.title("Box plots of Supply & Extract Air RH")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
